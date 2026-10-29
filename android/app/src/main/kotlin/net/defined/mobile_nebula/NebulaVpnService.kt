@@ -16,6 +16,7 @@ import java.io.File
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.time.OffsetDateTime
 
 
 class NebulaVpnService : VpnService() {
@@ -51,6 +52,7 @@ class NebulaVpnService : VpnService() {
     private val mClients = ArrayList<Messenger>()
 
     private val reloadReceiver: BroadcastReceiver = ReloadReceiver()
+    private var timeChangeReceiver: BroadcastReceiver? = null
     private var workManager: WorkManager? = null
 
     private var path: String? = null
@@ -144,6 +146,10 @@ class NebulaVpnService : VpnService() {
             Log.e(TAG, "Got a start command but we don't have a site to run")
             return
         }
+        if (timeChangeReceiver != null) {
+            // Already established and waiting for the clock
+            return
+        }
 
         val builder = Builder()
                 .setMtu(site!!.mtu)
@@ -235,6 +241,27 @@ class NebulaVpnService : VpnService() {
 
         try {
             vpnInterface = builder.establish()
+        } catch (e: Exception) {
+            Log.e(TAG, "Got an error $e")
+            announceExit(site!!.id, e.message ?: e.toString())
+            return stopSelf()
+        }
+
+        // Devices without a battery backed clock, like a Chromecast, boot with a clock far in the past
+        // and nebula would reject the cert as expired, wait for network time instead of giving up.
+        // The interface is already established so the system keeps its binding to us while we wait.
+        if (clockBeforeCerts()) {
+            Log.w(TAG, "Clock is before the certificate start time, waiting for network time")
+            timeChangeReceiver = TimeChangeReceiver()
+            ContextCompat.registerReceiver(this, timeChangeReceiver, IntentFilter(Intent.ACTION_TIME_CHANGED), ContextCompat.RECEIVER_NOT_EXPORTED)
+            return
+        }
+
+        startNebula()
+    }
+
+    private fun startNebula() {
+        try {
             nebula = mobileNebula.MobileNebula.newNebula(site!!.config, site!!.getKey(this), site!!.logFile, vpnInterface!!.detachFd().toLong())
             nebula!!.start(exitCallbackFor(nebula!!))
 
@@ -332,7 +359,36 @@ class NebulaVpnService : VpnService() {
         nebula?.reload(site!!.config, site!!.getKey(this))
     }
 
+    private fun clockBeforeCerts(): Boolean {
+        val now = OffsetDateTime.now()
+        return (listOfNotNull(site?.cert) + site!!.ca).any {
+            try {
+                now.isBefore(OffsetDateTime.parse(it.cert.notBefore))
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    inner class TimeChangeReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            if (clockBeforeCerts()) return
+
+            Log.i(TAG, "Clock is past the certificate start time, starting nebula")
+            unregisterReceiver(this)
+            timeChangeReceiver = null
+            startNebula()
+        }
+    }
+
     private fun stopVpn(error: String? = null) {
+        if (timeChangeReceiver != null) {
+            unregisterReceiver(timeChangeReceiver)
+            timeChangeReceiver = null
+            // Never handed to nebula, so it is still ours to close
+            vpnInterface?.close()
+        }
+
         if (nebula == null) {
             return stopSelf()
         }
